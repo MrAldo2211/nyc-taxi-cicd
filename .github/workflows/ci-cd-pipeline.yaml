@@ -1,0 +1,260 @@
+name: NYC Taxi CI-CD Pipeline (6-Hour Scheduler)
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_to_azure:
+        description: "Run live ingestion and upload outputs to Azure Blob Storage"
+        type: boolean
+        default: true
+      dataset_id:
+        description: "NYC Open Data Taxi dataset ID (4b4i-vvec = 2023, rwwi-khbc = 2024)"
+        type: string
+        default: "4b4i-vvec"
+      batch_limit:
+        description: "Number of taxi trip rows per batch ($limit)"
+        type: string
+        default: "25000"
+      batch_offset:
+        description: "Pagination offset ($offset) or 'auto' for run-number rotation"
+        type: string
+        default: "0"
+  schedule:
+    # Runs every 6 hours at 00:00, 06:00, 12:00, 18:00 UTC (07:00, 13:00, 19:00, 01:00 WIB)
+    - cron: "0 */6 * * *"
+
+jobs:
+  ci-test:
+    name: CI - Test & Fixture Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run Unit & Integration Tests (pytest)
+        run: pytest -v
+
+      - name: Run Fixture Pipeline & Validate Data Contracts
+        run: python -m src.pipeline fixture --output-dir artifacts/fixture
+
+      - name: Upload CI Fixture Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyc-taxi-ci-fixture-output
+          path: artifacts/fixture
+          retention-days: 14
+
+  cd-ingest-and-upload:
+    name: CD - Live Ingestion & Upload to Azure Blob
+    needs: ci-test
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.deploy_to_azure == true)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Azure Repository Variables
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          missing=0
+          for var_name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_STORAGE_ACCOUNT AZURE_STORAGE_CONTAINER; do
+            if [ -z "${!var_name}" ]; then
+              echo "::error::Missing GitHub Repository Variable: $var_name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Please configure all 5 Repository Variables in Settings -> Secrets and variables -> Actions -> Variables."
+            exit 1
+          fi
+          echo "All Azure repository variables are configured."
+
+      - name: Resolve Batch Parameters
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          INPUT_DATASET_ID: ${{ inputs.dataset_id }}
+          INPUT_LIMIT: ${{ inputs.batch_limit }}
+          INPUT_OFFSET: ${{ inputs.batch_offset }}
+        run: |
+          DATASET_ID="${INPUT_DATASET_ID:-4b4i-vvec}"
+          BATCH_LIMIT="${INPUT_LIMIT:-25000}"
+
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$INPUT_OFFSET" = "auto" ]; then
+            BATCH_OFFSET=$(( ((RUN_NUMBER - 1) * BATCH_LIMIT) % 5000000 ))
+          else
+            BATCH_OFFSET="${INPUT_OFFSET:-0}"
+          fi
+
+          echo "DATASET_ID=$DATASET_ID" >> "$GITHUB_ENV"
+          echo "BATCH_LIMIT=$BATCH_LIMIT" >> "$GITHUB_ENV"
+          echo "BATCH_OFFSET=$BATCH_OFFSET" >> "$GITHUB_ENV"
+          echo "Resolved ingestion config -> dataset_id=$DATASET_ID, limit=$BATCH_LIMIT, offset=$BATCH_OFFSET"
+
+      - name: Run Live NYC Taxi & Zones Ingestion Pipeline
+        run: |
+          python -m src.pipeline live \
+            --dataset-id "$DATASET_ID" \
+            --limit "$BATCH_LIMIT" \
+            --offset "$BATCH_OFFSET" \
+            --output-dir artifacts/live
+
+      - name: Extract Run Metadata to Environment
+        run: |
+          python - <<'EOF'
+          import json, os
+          from pathlib import Path
+
+          meta = json.loads(Path("artifacts/live/metadata/run_metadata.json").read_text(encoding="utf-8"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"RUN_ID={meta['run_id']}\n")
+              env_file.write(f"PARTITION_PATH={meta['partition_path']}\n")
+              env_file.write(f"RAW_TRIPS_COUNT={meta['raw_trips_count']}\n")
+              env_file.write(f"VALID_TRIPS_COUNT={meta['valid_trips_count']}\n")
+              env_file.write(f"DROPPED_TRIPS_COUNT={meta['dropped_invalid_trips_count']}\n")
+              env_file.write(f"UNIQUE_ZONES_COUNT={meta['unique_zones_count']}\n")
+          EOF
+
+      - name: Upload Live Pipeline Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyc-taxi-live-output-${{ github.run_number }}
+          path: artifacts/live
+          retention-days: 14
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload Outputs to Azure Blob Storage
+        env:
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          upload_blob() {
+            local src_file="$1"
+            local dest_blob="$2"
+            local content_type="$3"
+            az storage blob upload \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$STORAGE_CONTAINER" \
+              --file "$src_file" \
+              --name "$dest_blob" \
+              --content-type "$content_type" \
+              --auth-mode login \
+              --overwrite true \
+              --only-show-errors
+          }
+
+          # Partitioned data lake outputs
+          upload_blob "artifacts/live/raw/trips_raw.csv" "raw/trips/${PARTITION_PATH}/trips_raw.csv" "text/csv"
+          upload_blob "artifacts/live/raw/zones_raw.json" "raw/zones/${PARTITION_PATH}/zones_raw.json" "application/json"
+          upload_blob "artifacts/live/processed/zones_lookup.csv" "processed/zones_lookup/${PARTITION_PATH}/zones_lookup.csv" "text/csv"
+          upload_blob "artifacts/live/processed/trips_enriched.csv" "processed/trips_enriched/${PARTITION_PATH}/trips_enriched.csv" "text/csv"
+          upload_blob "artifacts/live/processed/zone_summary.csv" "processed/zone_summary/${PARTITION_PATH}/zone_summary.csv" "text/csv"
+          upload_blob "artifacts/live/metadata/run_metadata.json" "metadata/${PARTITION_PATH}/run_metadata.json" "application/json"
+
+          # Latest pointers for quick inspection & analytics
+          upload_blob "artifacts/live/processed/zones_lookup.csv" "latest/zones_lookup.csv" "text/csv"
+          upload_blob "artifacts/live/processed/trips_enriched.csv" "latest/trips_enriched.csv" "text/csv"
+          upload_blob "artifacts/live/processed/zone_summary.csv" "latest/zone_summary.csv" "text/csv"
+          upload_blob "artifacts/live/metadata/run_metadata.json" "latest/run_metadata.json" "application/json"
+
+      - name: Verify Blobs in Azure Storage
+        env:
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          echo "=== Verifying partitioned metadata & summary blobs ==="
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$STORAGE_CONTAINER" \
+            --prefix "processed/zone_summary/${PARTITION_PATH}" \
+            --auth-mode login \
+            --output table
+
+          echo "=== Verifying latest/ blobs ==="
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$STORAGE_CONTAINER" \
+            --prefix "latest/" \
+            --auth-mode login \
+            --output table
+
+      - name: Write Deployment Summary
+        env:
+          STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          STORAGE_CONTAINER: ${{ vars.AZURE_STORAGE_CONTAINER }}
+        run: |
+          python - <<'EOF'
+          import json, os
+          from pathlib import Path
+
+          meta = json.loads(Path("artifacts/live/metadata/run_metadata.json").read_text(encoding="utf-8"))
+          lines = [
+              "## NYC Yellow Taxi CI/CD Ingestion Summary",
+              "",
+              f"- **Run ID:** `{meta['run_id']}`",
+              f"- **Trigger Event:** `{os.environ.get('GITHUB_EVENT_NAME')}`",
+              f"- **Dataset ID:** `{meta['dataset_id']}` (limit `{meta['batch_limit']}`, offset `{meta['batch_offset']}`)",
+              f"- **Raw Trips:** {meta['raw_trips_count']:,} | **Valid Trips:** {meta['valid_trips_count']:,} | **Dropped Invalid:** {meta['dropped_invalid_trips_count']:,}",
+              f"- **Unique Taxi Zones:** {meta['unique_zones_count']}",
+              f"- **Azure Destination:** `{os.environ['STORAGE_ACCOUNT']}/{os.environ['STORAGE_CONTAINER']}` (partition `{meta['partition_path']}`)",
+              "",
+              "### Top 5 Pickup Zones by Total Revenue",
+              "",
+              "| Location ID | Zone | Borough | Trips | Total Revenue ($) |",
+              "| ---: | --- | --- | ---: | ---: |",
+          ]
+          for z in meta["top_5_pickup_zones"]:
+              lines.append(
+                  f"| {z['pulocationid']} | {z['pu_zone']} | {z['pu_borough']} | {z['trip_count']:,} | ${z['total_revenue']:,.2f} |"
+              )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          EOF
